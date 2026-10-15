@@ -1,0 +1,118 @@
+#!/bin/sh
+# Agent governance guard (pre-commit hook)
+# -----------------------------------------------------------------------------
+# Blocks any commit that modifies the frozen governance / strategy docs unless
+# the owner's explicit in-session override is set. This is the operational teeth for
+# STANDING ORDERS P7: "these change ONLY with the owner's explicit approval, never on
+# an agent's own initiative." See GOVERN.md -> "Enforcement reality (threat model)".
+#
+# HONEST THREAT MODEL: a local hook is a *speed bump*, not a vault. A shell-capable
+# agent could bypass it (--no-verify, edit the installed hook, unset the override).
+# Its job is to convert a SILENT governance edit into a DELIBERATE, visible override
+# that leaves a trace — which is the realistic enforcement at our scale. The true
+# server-side hard gate is GitHub branch protection (see hooks/README.md).
+#
+# Protected paths live in PROTECTED below. To extend, add one path per line
+# (a trailing "/" means "this dir and everything under it").
+#
+# ALLOWED carves specific files BACK OUT of the freeze. The append-only
+# audit logs are written constantly and are low-risk by design; freezing them just
+# trains agents to skip logging or burn the override on routine rows, eroding the
+# gate on the rules that matter. We keep the broad freeze-by-default (so new
+# governance files stay protected automatically) and punch named holes for the logs.
+# (Tampering with OLD rows is a separate control, not solved by a commit freeze.)
+# -----------------------------------------------------------------------------
+
+PROTECTED='STRATEGY.md
+governance/'
+
+ALLOWED='governance/decision-log.md
+governance/review-history.md'
+
+# PARTIAL (owner-approved) — review-queue.md is frozen in its RULES
+# region and writable in its QUEUE region. Rationale: the file's own footer
+# instructs agents to file entries, while the freeze forbade touching the file at
+# all, so the documented workflow could not be performed by the agent it was
+# written for. A queue nothing may write to cannot collect what is waiting on
+# the owner — which is its only job.
+#
+# What stays frozen: everything from line 1 through the PENDING marker — the
+# TRIGGERS list, the status flow, the format, and the marker line itself. The owner
+# alone changes the rules; agents may only add things waiting on him BELOW them.
+# An agent still cannot APPROVE anything, so the owner remains the only gate.
+# Known + accepted: the short "To add:" footer sits below the marker and is
+# therefore writable. It is a how-to note, not a rule or a trigger.
+PARTIAL='governance/review-queue.md'
+PARTIAL_MARKER='^## 🟢 PENDING'
+
+# Rules region unchanged between HEAD and the staged version? 0 = yes (allow).
+rules_region_unchanged() {
+  _f="$1"
+  # New file, or no HEAD (initial commit): nothing to compare — stay conservative.
+  git cat-file -e "HEAD:$_f" 2>/dev/null || return 1
+  _head=$(git show "HEAD:$_f" 2>/dev/null | sed -n "1,/$PARTIAL_MARKER/p")
+  _stag=$(git show ":$_f"     2>/dev/null | sed -n "1,/$PARTIAL_MARKER/p")
+  # Marker missing on either side = the rules region itself was restructured.
+  printf '%s' "$_head" | grep -q "$PARTIAL_MARKER" || return 1
+  printf '%s' "$_stag" | grep -q "$PARTIAL_MARKER" || return 1
+  [ "$_head" = "$_stag" ]
+}
+
+# Files staged for this commit (added / copied / modified / renamed).
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$staged" ] && exit 0
+
+hits=""
+for f in $staged; do
+  # Append-only audit logs are carved out of the freeze — never block them.
+  for a in $ALLOWED; do
+    [ "$f" = "$a" ] && continue 2
+  done
+  # Partial freeze: allow queue-region edits, block rules-region edits.
+  if [ "$f" = "$PARTIAL" ]; then
+    if rules_region_unchanged "$f"; then
+      continue
+    fi
+    hits="$hits$f  (RULES region — triggers/format/marker)
+"
+    continue
+  fi
+  for p in $PROTECTED; do
+    # exact match (STRATEGY.md) OR prefix match (the governance/ dir)
+    case "$f" in
+      "$p") hits="$hits$f
+" ;;
+      "$p"*)
+        # only treat as prefix when the protected path is a directory (ends in /)
+        case "$p" in
+          */) hits="$hits$f
+" ;;
+        esac
+        ;;
+    esac
+  done
+done
+
+[ -z "$hits" ] && exit 0
+
+if [ "${SLAY_GOVERN_OK:-}" = "1" ]; then
+  echo "🔓 P7 override active (SLAY_GOVERN_OK=1) — allowing governance commit:"
+  printf '%s' "$hits" | sed 's/^/   - /'
+  echo "   Reminder: P7 requires the owner's explicit approval — log it in governance/decision-log.md."
+  exit 0
+fi
+
+echo "🛑 BLOCKED by the Slay OS P7 governance guard."
+echo ""
+echo "This commit touches frozen governance / strategy docs:"
+printf '%s' "$hits" | sed 's/^/   - /'
+echo ""
+echo "Per AGENTS.md (STANDING ORDERS P7) + GOVERN.md, these change ONLY with the owner's"
+echo "explicit approval — never on an agent's own initiative."
+echo '"A kill switch the agent can rewrite is not a kill switch."'
+echo ""
+echo "If the owner approved this change in-session, re-run with the override:"
+echo "    SLAY_GOVERN_OK=1 git commit ..."
+echo "and log it in governance/decision-log.md."
+exit 1
+
